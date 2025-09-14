@@ -4,7 +4,9 @@ Personal repo to learn building GPT from scratch
 
 ## Roadmap
 
-- [ ] Vanilla MHA
+### Attention
+- [x] Vanilla MHA
+- [ ] Multi-Query-Attention, Group-Query-Attention
 
 ## Reference
 
