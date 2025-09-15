@@ -11,7 +11,7 @@ GPT_CONFIG_124M = {
     "context_length": 1024,
     "emb_dim": 768,
     "n_heads": 12,
-    "n_layers": 3,  # the original GPT-2 has 12 layers
+    "n_layers": 12,  # the original GPT-2 has 12 layers
     "dropout": 0.1,
     "qkv_bias": False
 }
@@ -91,7 +91,7 @@ class GPT(nn.Module):
         # stability that layer norm works on individual feature dimension instead of 
         # batch dimension which is subsequential to change in LLM
         self.final_norm = LayerNorm(cfg["emb_dim"])
-        self.out_head = nn.Linear(cfg["emb_dim"], cfg["vocab_size"])
+        self.out_head = nn.Linear(cfg["emb_dim"], cfg["vocab_size"], bias=False)
 
     def forward(self, inputs):
         B, T = inputs.shape
@@ -110,9 +110,11 @@ class GPT(nn.Module):
         return logits
 
 
-def generate(model, idx, max_new_tokens, context_size):
+def generate(model, idx, max_new_tokens, context_size, top_k=None, temperature=None):
     """
     Decoding phase of the model
+
+    Implement the top-k sampling, temperature and greedy sampling
     """
     for _ in range(max_new_tokens):
         idx_cond = idx[:, -context_size:]  # (B, context_size)
@@ -121,12 +123,36 @@ def generate(model, idx, max_new_tokens, context_size):
 
         # the last hidden state is the probability of the next token
         logits = logits[:, -1, :]  # (B, vocab_size)
-        probs = torch.softmax(logits, dim=-1)  # (B, vocab_size)
-        # this is the greedy decoding, which we select the largest prob
-        idx_next = torch.argmax(probs, dim=-1, keepdim=True)  # (B, 1)
+
+        # top-k sampling
+        if top_k:
+            top_k_logits, _ = torch.topk(logits, top_k)  # B, top_k
+            # extract the minimum value of top-k logits for each sample row
+            min_val = top_k_logits[:, -1]  # B,
+            # filter value less then min_val, set to -inf
+            logits = torch.where(logits < min_val, float('-inf'), logits)
+
+        if temperature:
+            logits = logits / temperature
+            probs = torch.softmax(logits, dim=-1)  # (B, vocab_size)
+            idx_next = torch.multinomial(probs, num_samples=1)  # (B, 1)
+        else:
+            probs = torch.softmax(logits, dim=-1)  # (B, vocab_size)
+            # this is the greedy decoding, which we select the largest prob
+            idx_next = torch.argmax(probs, dim=-1, keepdim=True)  # (B, 1)
         idx = torch.concat([idx, idx_next], dim=1)  # (B, context_size + 1)
 
     return idx
+
+def generate_and_print_sample(model, tokenizer, device, start_context):
+    model.eval()
+    # position embedding encodes the context window length
+    context_size = model.pos_emb.weight.shape[0]
+    idx = torch.tensor(tokenizer.encode(start_context)).unsqueeze(0).to(device)
+    idx = generate(model, idx, max_new_tokens=50, context_size=context_size, top_k=25, temperature=1.4)
+    decoded_text = tokenizer.decode(idx.squeeze(0).tolist())
+    print(decoded_text.replace("\n", " "))
+    model.train()
 
 
 if __name__ == "__main__":

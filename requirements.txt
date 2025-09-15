@@ -1,2 +1,5 @@
+# need macos version for apple silicon
+tensorflow-macos
 torch
+tqdm
 pytest
