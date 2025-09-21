@@ -8,7 +8,7 @@ class MultiHeadCausalAttention(nn.Module):
 
     Support kv cache for efficient inference
     """
-    def __init__(self, d_in, d_out, max_seq_len, num_heads, drop_out=0.1,bias=False):
+    def __init__(self, d_in, d_out, max_seq_len, num_heads, drop_out=0.1, bias=False):
         super().__init__()
         # the project layers for q, k, v; why do we need this? because the self-attention
         # does not comes up with many learnable parameters, thus we need this learnable
