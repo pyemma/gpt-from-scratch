@@ -5,6 +5,8 @@ import torch.nn as nn
 class MultiHeadCausalAttention(nn.Module):
     """
     A basic implementation of multi-head causal self-attention
+
+    Support kv cache for efficient inference
     """
     def __init__(self, d_in, d_out, max_seq_len, num_heads, drop_out=0.1,bias=False):
         super().__init__()
@@ -33,9 +35,11 @@ class MultiHeadCausalAttention(nn.Module):
         self.num_heads = num_heads
         self.head_dim = d_out // num_heads
 
-    def forward(self, x):
+    def forward(self, x, use_cache=False, kv_cache=None):
         """
-        x: (B, T, d_in)
+        x: (B, T, d_in), when kv_cache is used, T is 1 which is the new token during decoding
+        use_cache: whether to use kv cache or not, turned off during training
+        kv_cache: past kv tensors, of shape (B, num_heads, T, d_in)
         """
         B, T, _ = x.shape
 
@@ -54,7 +58,18 @@ class MultiHeadCausalAttention(nn.Module):
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
 
-        attn_scores = torch.matmul(q, k.transpose(-2, -1))  # B, num_heads, T, T
+        # if use_cache is True and kv_cache is given, we need to append to pervious kv cache
+        new_kv_cache = kv_cache
+        if use_cache and kv_cache is not None:
+            past_k, past_v = kv_cache  # B, num_heads, past_seq+len, head_dim
+            PAST_T = past_k.shape[-2]
+            k = torch.cat([past_k, k], dim=-2)  # B, num_heads, PAST_T + T, head_dim
+            v = torch.cat([past_v, v], dim=-2)  # B, num_heads, PAST_T + T, head_dim
+        
+        if use_cache:
+            new_kv_cache = (k, v)  # for prefill stage, the kv_cache would be empty and we need to correctly populate it
+
+        attn_scores = torch.matmul(q, k.transpose(-2, -1))  # B, num_heads, T, T (PAST_T + T)
         # the reason that we need the scale here is to handle the large hidden dimension usually
         # used in GPT, otherwise the backward gradient will be too small
         attn_scores = attn_scores / self.scale
@@ -62,9 +77,13 @@ class MultiHeadCausalAttention(nn.Module):
         # apply the causal mask, we need to apply the mask to the original attention scores
         # first, otherwise the softmax is not normalized
         # add a slice to handle the case where the input sequence is shorter than the max_seq_len
-        attn_scores = attn_scores.masked_fill(self.mask[:, :, :T, :T] == 0 ,float('-inf'))
+        if use_cache and kv_cache is not None:
+            # the mask should start from row PAST_T to PAST_T+T, up to the PAST_T+T column
+            attn_scores = attn_scores.masked_fill(self.mask[:, :, PAST_T:PAST_T+T, :PAST_T+T] == 0 ,float('-inf'))
+        else:
+            attn_scores = attn_scores.masked_fill(self.mask[:, :, :T, :T] == 0 ,float('-inf'))
 
-        attn_weights = torch.softmax(attn_scores, dim=-1)  # B, num_heads, T, T
+        attn_weights = torch.softmax(attn_scores, dim=-1)  # B, num_heads, T, T (PAST_T + T)
 
         # apply the dropout
         attn_weights = self.attn_dropout(attn_weights)
@@ -78,4 +97,4 @@ class MultiHeadCausalAttention(nn.Module):
 
         # transpose to make the dimension order to be (B, T, d_out)
         attn_output = self.o_w(attn_output)  # B, T, d_out
-        return attn_output
+        return attn_output, new_kv_cache
