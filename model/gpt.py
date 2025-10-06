@@ -136,10 +136,12 @@ def generate(
 
     Implement the top-k sampling, temperature and greedy sampling
     """
+    kv_caches = [None] * len(model.blocks)
+    
     for _ in range(max_new_tokens):
         idx_cond = idx[:, -context_size:]  # (B, context_size)
         with torch.no_grad():
-            logits, _ = model(idx_cond)
+            logits, _ = model(idx_cond, use_cache=False, kv_caches=kv_caches)
 
         # the last hidden state is the probability of the next token
         logits = logits[:, -1, :]  # (B, vocab_size)

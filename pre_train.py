@@ -17,13 +17,6 @@ GPT_CONFIG_124M = {
     "qkv_bias": True
 }
 
-settings, params = download_and_load_gpt2(
-    model_size="124M", models_dir="gpt2"
-)
-
-model = GPT(GPT_CONFIG_124M)
-model.eval()
-
 def assign(left, right):
     if left.shape != right.shape:
         raise ValueError(f"Shape mismatch: {left.shape} != {right.shape}")
@@ -86,18 +79,30 @@ def load_weights_into_gpt(gpt, params):
     gpt.final_norm.shift = assign(gpt.final_norm.shift, params["b"])
     gpt.out_head.weight = assign(gpt.out_head.weight, params["wte"])
 
-load_weights_into_gpt(model, params)
+def pre_train_gpt_model():
+    settings, params = download_and_load_gpt2(
+        model_size="124M", models_dir="gpt2"
+    )
+    model = GPT(GPT_CONFIG_124M)
+    model.eval()
+    load_weights_into_gpt(model, params)
+    return model
 
-tokenizer = tiktoken.get_encoding("gpt2")
-device = "cpu"
+if __name__ == "__main__":
+    model = pre_train_gpt_model()
 
-torch.manual_seed(123)
-token_ids = generate(
-    model=model,
-    idx=torch.tensor(tokenizer.encode("Every effort moves you")).unsqueeze(0).to(device),
-    max_new_tokens=25,
-    context_size=GPT_CONFIG_124M["context_length"],
-    top_k=50,
-    temperature=1.5
-)
-print("Output text:\n", tokenizer.decode(token_ids.squeeze(0).tolist()))
+    tokenizer = tiktoken.get_encoding("gpt2")
+    device = "cpu"
+
+    torch.manual_seed(123)
+    token_ids = generate(
+        model=model,
+        idx=torch.tensor(tokenizer.encode("Every effort moves you")).unsqueeze(0).to(device),
+        max_new_tokens=25,
+        context_size=GPT_CONFIG_124M["context_length"],
+        top_k=50,
+        temperature=1.5
+    )
+    print("Output text:\n", tokenizer.decode(token_ids.squeeze(0).tolist()))
+
+    print(model)
