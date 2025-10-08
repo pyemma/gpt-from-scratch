@@ -29,7 +29,7 @@ class MultiHeadCausalAttention(nn.Module):
         self.register_buffer("mask", mask.view(1, 1, max_seq_len, max_seq_len))  # (B, num_heads, T, T)
 
         # add a dropout layer
-        self.attn_dropout = nn.Dropout(p=0.1)
+        self.attn_dropout = nn.Dropout(p=drop_out)
 
         # head dimension
         self.num_heads = num_heads

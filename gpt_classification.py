@@ -69,11 +69,19 @@ def calc_loss_dataloader(dataloader, model, device, num_batches=None):
     return total_loss / num_batches
 
 
+def eval_model(model, train_loader, val_loader, device, eval_iter):
+    model.eval()
+    with torch.no_grad():
+        train_loss = calc_loss_dataloader(train_loader, model, device, num_batches=eval_iter)
+        val_loss = calc_loss_dataloader(val_loader, model, device, num_batches=eval_iter)
+    model.train()
+    return train_loss, val_loss
+
+
 def train(num_epochs=4):
     device = "mps"
     model = setup_model()
     model.to(device)
-    kv_caches = [None] * len(model.blocks)
     global_step = 0
     train_loader, val_loader, test_loader = create_dataloader("./sms-spam-collection/SMSSpamCollection", batch_size=32, num_workers=0)
     optimizer = optim.AdamW(model.parameters(), lr=5e-5, weight_decay=0.1)
@@ -90,9 +98,8 @@ def train(num_epochs=4):
             global_step += 1
 
             if global_step % 10 == 0:
-                train_loss = running_loss / 100
-                print(f"Epoch {epoch}, Step {global_step}, Train loss: {train_loss:.4f}")
-                running_loss = 0.0
+                train_loss, val_loss = eval_model(model, train_loader, val_loader, device, eval_iter=4)
+                print(f"Epoch {epoch}, Step {global_step}, Train loss: {train_loss:.4f}, Val loss: {val_loss:.4f}")
         
         train_accuracy = calc_accuracy_loader(train_loader, model, device, num_batches=4)
         val_accuracy = calc_accuracy_loader(val_loader, model, device, num_batches=4)
