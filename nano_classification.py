@@ -2,27 +2,24 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 
-from pre_train import pre_train_gpt_model, GPT_CONFIG_124M
+from model.nano import GPT
 from data.spam_dataloader import create_dataloader
 
 
-KV_CACHES = [None] * GPT_CONFIG_124M["n_layers"]
-
 def setup_model():
-    model = pre_train_gpt_model()
-
+    model = GPT.from_pretrained("gpt2")
     # freeze all parameters
     for param in model.parameters():
         param.requires_grad = False
 
     # update the head to binary classification
-    model.out_head = nn.Linear(GPT_CONFIG_124M["emb_dim"], 2)
+    model.lm_head = nn.Linear(model.config.n_embd, 2)
 
     # also set the last transformer block and layer norm to be trainable
-    for param in model.blocks[-1].parameters():
+    for param in model.transformer.h[-1].parameters():
         param.requires_grad = True
 
-    for param in model.final_norm.parameters():
+    for param in model.transformer.ln_f.parameters():
         param.requires_grad = True
     
     return model
@@ -40,7 +37,7 @@ def calc_accuracy_loader(dataloader, model, device, num_batches=None):
         input_batch = input_batch.to(device)
         label = label.to(device)
         with torch.no_grad():
-            logits, _ = model(input_batch, use_cache=False, kv_caches=KV_CACHES)
+            logits, _ = model(input_batch)
         
         preds = torch.argmax(logits[:, -1, :], dim=-1)  # B, 1
 
@@ -49,14 +46,6 @@ def calc_accuracy_loader(dataloader, model, device, num_batches=None):
 
     return correct_predictions / total_samples
 
-def calc_loss_batch(input_batch, label, model, device):
-    input_batch = input_batch.to(device)
-    label = label.to(device)
-    logits, _ = model(input_batch, use_cache=False, kv_caches=KV_CACHES)
-    logits = logits[:, -1, :]
-    loss = torch.nn.functional.cross_entropy(logits, label)
-    return loss
-
 
 def calc_loss_dataloader(dataloader, model, device, num_batches=None):
     total_loss = 0.0
@@ -64,7 +53,9 @@ def calc_loss_dataloader(dataloader, model, device, num_batches=None):
     for i, (input_batch, label) in enumerate(dataloader):
         if i >= num_batches:
             break
-        loss = calc_loss_batch(input_batch, label, model, device)
+        input_batch = input_batch.to(device)
+        label = label.to(device)
+        _, loss = model(input_batch, targets=label)
         total_loss += loss.item()
     return total_loss / num_batches
 
@@ -84,14 +75,17 @@ def train(num_epochs=4):
     model.to(device)
     global_step = 0
     train_loader, val_loader, test_loader = create_dataloader("./sms-spam-collection/SMSSpamCollection", batch_size=32, num_workers=0)
-    optimizer = optim.AdamW(model.parameters(), lr=5e-5, weight_decay=0.1)
+    optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=5e-5, betas=(0.9, 0.95), device_type=device)
 
     for epoch in range(num_epochs):
         model.train()
 
         for i, (input_batch, label) in enumerate(train_loader):
             optimizer.zero_grad()
-            loss = calc_loss_batch(input_batch, label, model, device)
+
+            input_batch = input_batch.to(device)
+            label = label.to(device)
+            _, loss = model(input_batch, targets=label)
             loss.backward()
             optimizer.step()
 
