@@ -1,5 +1,10 @@
+from dataclasses import dataclass
+import math
+
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+
 
 
 class MultiHeadCausalAttention(nn.Module):
@@ -8,7 +13,7 @@ class MultiHeadCausalAttention(nn.Module):
 
     Support kv cache for efficient inference
     """
-    def __init__(self, d_in, d_out, max_seq_len, num_heads, drop_out=0.1,bias=False):
+    def __init__(self, d_in, d_out, max_seq_len, num_heads, drop_out=0.1, bias=False):
         super().__init__()
         # the project layers for q, k, v; why do we need this? because the self-attention
         # does not comes up with many learnable parameters, thus we need this learnable
@@ -98,3 +103,89 @@ class MultiHeadCausalAttention(nn.Module):
         # transpose to make the dimension order to be (B, T, d_out)
         attn_output = self.o_w(attn_output)  # B, T, d_out
         return attn_output, new_kv_cache
+
+
+@dataclass
+class Config:
+    block_size: int = 1024
+    n_embd: int = 768
+    dropout: float = 0.0
+    bias: bool = True
+    n_head: int = 12
+    n_kv_head: int = 4
+
+class CausalGroupQueryAttention(nn.Module):
+    """
+    Group query attention build on top of the causal self-attention
+    from nanoGPT implementation
+    """
+
+    def __init__(self, config):
+        super().__init__()
+
+        self.head_dim = config.n_embd // config.n_head
+        # projection for query
+        self.q_w = nn.Linear(config.n_embd, self.head_dim * config.n_head, bias=config.bias)
+        # projection for key and value
+        self.kv_w = nn.Linear(config.n_embd, self.head_dim * config.n_kv_head * 2, bias=config.bias)
+        # output projection
+        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+        # regularization
+        self.attn_dropout = nn.Dropout(config.dropout)
+        self.resid_dropout = nn.Dropout(config.dropout)
+
+        self.n_head = config.n_head  # query head
+        self.n_kv_head = config.n_kv_head  # kv head
+        self.n_embd = config.n_embd
+        self.dropout = config.dropout
+
+        self.register_buffer("mask", torch.tril(torch.ones(config.block_size, config.block_size))
+                                     .view(1, 1, config.block_size, config.block_size))
+
+    def forward(self, x):
+        B, T, C = x.shape
+        # calculate query, key, value
+        q = self.q_w(x)  # B, T, head_dim * n_head
+        k, v = self.kv_w(x).split(self.head_dim * self.n_kv_head, dim=2)  # B, T, head_dim * n_kv_head
+
+        q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2)  # B, n_head, T, head_dim
+        k = k.view(B, T, self.n_kv_head, self.head_dim).transpose(1, 2)  # B, n_kv_head, T, head_dim
+        v = v.view(B, T, self.n_kv_head, self.head_dim).transpose(1, 2)  # B, n_kv_head, T, head_dim
+
+        # expand the key and value to match the number of heads
+        kv_head_repeat = self.n_head // self.n_kv_head
+        k = k.repeat_interleave(kv_head_repeat, dim=1)
+        v = v.repeat_interleave(kv_head_repeat, dim=1)
+
+        # causal self-attention (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
+        att = (q @ k.transpose(-2, -1)) * (1 / math.sqrt(k.shape[-1]))
+        att = att.masked_fill(self.mask[:, :, :T, :T] == 0, float('-inf'))
+        att = F.softmax(att, dim=-1)
+        att = self.attn_dropout(att)
+        y = att @ v  # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+
+        y = y.transpose(1, 2).contiguous().view(B, T, C)  # reshape back and make it contiguous
+        y = self.resid_dropout(self.c_proj(y))
+
+        return y
+
+def get_num_params(module):
+    return sum(p.numel() for p in module.parameters())
+
+if __name__ == "__main__":
+    config = Config()
+    module = CausalGroupQueryAttention(config)
+    x = torch.randn(32, 512, config.n_embd)
+    out = module(x)
+    print(out.shape)
+
+    multi_head_attn = MultiHeadCausalAttention(d_in=config.n_embd, d_out=config.n_embd, max_seq_len=config.block_size, num_heads=config.n_head)
+    out, _ = multi_head_attn(x)
+    print(out.shape)
+
+    print(f"""
+Compare the total number of parameters between the two modules:
+GQA: {get_num_params(module)}
+Multi-head: {get_num_params(multi_head_attn)}
+Ratio: {get_num_params(module) / get_num_params(multi_head_attn)}
+        """)
