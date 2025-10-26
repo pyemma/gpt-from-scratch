@@ -30,8 +30,9 @@ class CausalSelfAttention(nn.Module):
     This does not use PyTorch sdpa implementation yet
     """
 
-    def __init__(self, config):
+    def __init__(self, config, layer_idx):
         super().__init__()
+        self.layer_idx = layer_idx
 
         # projection for qkv
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
@@ -48,7 +49,7 @@ class CausalSelfAttention(nn.Module):
         self.register_buffer("mask", torch.tril(torch.ones(config.block_size, config.block_size))
                                      .view(1, 1, config.block_size, config.block_size))
 
-    def forward(self, x):
+    def forward(self, x, kv_cache):
         B, T, C = x.shape
         # calculate query, key, value
         q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
@@ -56,12 +57,37 @@ class CausalSelfAttention(nn.Module):
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # B, n_head, T, head_dim
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # B, n_head, T, head_dim
 
-        # causal self-attention (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
-        att = (q @ k.transpose(-2, -1)) * (1 / math.sqrt(k.shape[-1]))
-        att = att.masked_fill(self.mask[:, :, :T, :T] == 0, float('-inf'))
-        att = F.softmax(att, dim=-1)
-        att = self.attn_dropout(att)
-        y = att @ v  # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+        # apply kv cache
+        if kv_cache is not None:
+            k, v = kv_cache.insert_kv(self.layer_idx, k, v)  # insert and get the full kv cache
+        
+        Tq = q.shape[-2]
+        Tk = k.shape[-2]
+
+        # no kv cache or this is the prefill where q == k
+        if kv_cache is None or Tq == Tk:
+            # causal self-attention (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
+            # att = (q @ k.transpose(-2, -1)) * (1 / math.sqrt(k.shape[-1]))
+            # att = att.masked_fill(self.mask[:, :, :T, :T] == 0, float('-inf'))
+            # att = F.softmax(att, dim=-1)
+            # att = self.attn_dropout(att)
+            # y = att @ v  # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+            
+            # use the pytorch sdpa implementation for consistency
+            y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        elif Tq == 1:
+            # during decoding only 1 token is input, attend all past kv attention
+            y = F.scaled_dot_product_attention(q, k, v, is_causal=False)
+        else:
+            # during decoding and multiple queries are given, we need a slightly different
+            # masking here, all queries could attend all past keys, but the queries are causal
+            attn_mask = torch.zeros((Tq, Tk), dtype=torch.bool, device=q.device)
+            prefix_len = Tk - Tq
+            # all queries could attend all kv cache
+            attn_mask[:, :prefix_len] = True
+            # but the queries are causal
+            attn_mask[:, prefix_len:] = torch.tril(torch.ones((Tq, Tq), dtype=torch.bool, device=q.device))
+            y = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
 
         y = y.transpose(1, 2).contiguous().view(B, T, C)  # reshape back and make it contiguous
         y = self.resid_dropout(self.c_proj(y))
@@ -88,15 +114,15 @@ class MLP(nn.Module):
 
 class Block(nn.Module):
     
-    def __init__(self, config):
+    def __init__(self, config, layer_idx):
         super().__init__()
         self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
-        self.attn = CausalSelfAttention(config)
+        self.attn = CausalSelfAttention(config, layer_idx)
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
 
-    def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
+    def forward(self, x, kv_cache):
+        x = x + self.attn(self.ln_1(x), kv_cache)
         x = x + self.mlp(self.ln_2(x))
         return x
 
@@ -122,7 +148,7 @@ class GPT(nn.Module):
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             wpe = nn.Embedding(config.block_size, config.n_embd),
             drop = nn.Dropout(config.dropout),
-            h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
+            h = nn.ModuleList([Block(config, layer_idx=i) for i in range(config.n_layer)]),
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
         ))
 
@@ -152,17 +178,20 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, targets=None):
+    def forward(self, idx, targets=None, kv_cache=None):
         device = idx.device
         b, t = idx.shape
         pos = torch.arange(0, t, dtype=torch.long, device=device)
+        # if kv cache is not none, we need to shift the position
+        if kv_cache is not None:
+            pos = pos + kv_cache.get_pos()
 
         tok_emb = self.transformer.wte(idx)
         pos_emb = self.transformer.wpe(pos)
 
         x = self.transformer.drop(tok_emb + pos_emb)
         for block in self.transformer.h:
-            x = block(x)
+            x = block(x, kv_cache)
         x = self.transformer.ln_f(x)
 
         if targets is not None:
