@@ -98,7 +98,7 @@ class MultiHeadCausalAttention(nn.Module):
         attn_output = torch.matmul(attn_weights, v)  # B, num_heads, T, head_dim
 
         # reshape attention output back to (B, T, d_out)
-        attn_output = attn_output.contiguous().view(B, T, self.num_heads * self.head_dim)
+        attn_output = attn_output.transpose(1, 2).contiguous().view(B, T, self.num_heads * self.head_dim)
 
         # transpose to make the dimension order to be (B, T, d_out)
         attn_output = self.o_w(attn_output)  # B, T, d_out
